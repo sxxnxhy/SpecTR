@@ -1,4 +1,4 @@
-
+# model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,38 +6,26 @@ from transformers import AutoModel
 import config
 import numpy as np
 from peft import get_peft_model, LoraConfig, TaskType
-import math
 
 class GaussianFourierProjection(nn.Module):
     def __init__(self, embed_dim, scale=30.0):
         super().__init__()
-        # Random B matrix (fixed, not learnable)
-        # scale controls the frequency spectrum. Higher scale = higher freq sensitivity.
         self.B = nn.Parameter(torch.randn(1, embed_dim // 2) * scale, requires_grad=False)
-        # B is a matrix of random numbers sampled from a Gaussian distribution (scale = 30.0).
 
     def forward(self, x):
         # x: [Batch, Seq, 1]
-        # x_proj: [Batch, Seq, embed_dim/2]
         x_proj = (2 * np.pi * x) @ self.B 
-        # cat: [Batch, Seq, embed_dim]
         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
 class MSEncoder(nn.Module):
-    """
-    Input: (m/z, intensity) pairs.
-    Architecture:
-      1. m/z -> Fourier Projection (256) -> MLP
-      2. intensity -> Fourier Projection (64) -> MLP  <-- [CHANGED]
-      3. Concat -> Fusion -> Transformer
-    """
     def __init__(self, encoder_config, embedding_dim):
         super().__init__()
         
-        d_model = encoder_config['d_model']
-        fourier_dim = encoder_config['fourier_dim'] # e.g. 256
+        d_model = encoder_config['d_model'] # Now 768
+        fourier_dim = encoder_config['fourier_dim'] 
         
         # --- 1. m/z Pathway (Location) ---
+        # Uses Fourier Features for high frequency position info
         self.mz_fourier = GaussianFourierProjection(fourier_dim, scale=30.0)
         self.mz_mlp = nn.Sequential(
             nn.Linear(fourier_dim, d_model),
@@ -46,26 +34,22 @@ class MSEncoder(nn.Module):
         )
         
         # --- 2. Intensity Pathway (Magnitude) [FIXED] ---
-        # Old: Linear(1, 768) -> Inefficient scalar scaling
-        # New: Fourier(1 -> 64) -> Linear(64, 768) -> Rich pattern matching
-        self.int_fourier_dim = 64 
-        self.int_fourier = GaussianFourierProjection(self.int_fourier_dim, scale=10.0)
-        
+        # REMOVED Fourier Projection. Now simple scalar projection.
         self.int_mlp = nn.Sequential(
-            nn.Linear(self.int_fourier_dim, d_model), # 64 -> 768
+            nn.Linear(1, d_model), # Project scalar directly to d_model
             nn.GELU(),
             nn.Linear(d_model, d_model)
         )
         
         # --- 3. Fusion Layer ---
-        # Takes [mz_emb; int_emb] -> Fuses to [d_model]
         self.fusion = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.LayerNorm(d_model)
         )
         
         # --- 4. Transformer ---
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        # [FIXED] Initialize with random noise, not zeros
+        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         
         transformer_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -80,7 +64,6 @@ class MSEncoder(nn.Module):
             num_layers=encoder_config['n_layers']
         )
         
-        # Projection head
         self.projection = nn.Sequential(
             nn.Linear(d_model, embedding_dim * 2),
             nn.LayerNorm(embedding_dim * 2),
@@ -99,9 +82,7 @@ class MSEncoder(nn.Module):
         mz_emb = self.mz_mlp(mz_emb)     
         
         # 2. Encode intensity [FIXED]
-        # Now projects scalar intensity to 64-dim Fourier features first
-        int_emb = self.int_fourier(int_val) 
-        int_emb = self.int_mlp(int_emb)
+        int_emb = self.int_mlp(int_val)
         
         # 3. Concatenate & Fuse
         cat_feat = torch.cat([mz_emb, int_emb], dim=-1) 
@@ -123,34 +104,23 @@ class MSEncoder(nn.Module):
         # 7. Output
         cls_output = out[:, 0, :]
         projected = self.projection(cls_output)
-        return F.normalize(projected, p=2, dim=1)
+        return F.normalize(projected, p=2, dim=1, eps=1e-6)
 
 class TextEncoder(nn.Module):
     def __init__(self, model_name, embedding_dim):
         super().__init__()
-        self.bert = AutoModel.from_pretrained(
-            model_name,
-            use_safetensors=True
-            )
+        self.bert = AutoModel.from_pretrained(model_name, use_safetensors=True)
         
-        if config.TEXT_ENCODER['freeze_bert']:
-            for param in self.bert.parameters():
-                param.requires_grad = False
-                
-                
         lora_config = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION, # We are just getting embeddings
-            r=config.LORA['r'],  # Rank (hyperparameter, 8 or 16 is common)
-            lora_alpha=config.LORA['lora_alpha'], # (hyperparameter, often 2*r)
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=config.LORA['r'],
+            lora_alpha=config.LORA['lora_alpha'],
             lora_dropout=config.LORA['lora_dropout'],
-            target_modules=config.LORA['target_modules'] # Apply to attention layers
+            target_modules=config.LORA['target_modules']
         )
         self.bert = get_peft_model(self.bert, lora_config)
-        print("\nTextEncoder (LoRA) Trainable Parameters:")
-        self.bert.print_trainable_parameters()
         
         bert_dim = self.bert.config.hidden_size
-        
         self.projection = nn.Sequential(
             nn.Linear(bert_dim, embedding_dim * 2),
             nn.ReLU(),
@@ -159,8 +129,6 @@ class TextEncoder(nn.Module):
 
     def forward(self, input_ids, attention_mask):
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        
-        # Mean Pooling
         token_embeddings = outputs.last_hidden_state
         input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
         sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
@@ -168,26 +136,19 @@ class TextEncoder(nn.Module):
         mean_pooled_embedding = sum_embeddings / (sum_mask + 1e-9)
         
         projected = self.projection(mean_pooled_embedding)
-        x = F.normalize(projected, p=2, dim=1)
-        return x
+        return F.normalize(projected, p=2, dim=1, eps=1e-6)
 
 class CLIPModel(nn.Module):
-    
     def __init__(self):
         super().__init__()
         self.ms_encoder = MSEncoder(config.MS_ENCODER, config.EMBEDDING_DIM)
-        self.text_encoder = TextEncoder(
-            config.TEXT_ENCODER['model_name'],
-            config.EMBEDDING_DIM
-        )
+        self.text_encoder = TextEncoder(config.TEXT_ENCODER['model_name'], config.EMBEDDING_DIM)
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / config.TEMPERATURE))
 
     def forward(self, peak_sequence, peak_mask, input_ids, attention_mask):
-        # peak_sequence, peak_mask를 ms_encoder로 전달
         spec_embeds = self.ms_encoder(peak_sequence, peak_mask)
         text_embeds = self.text_encoder(input_ids, attention_mask)
         
-        # Loss 계산
         batch_size = spec_embeds.shape[0]
         logits_per_spec = (spec_embeds @ text_embeds.T) * self.logit_scale.exp()
         logits_per_text = logits_per_spec.T
@@ -195,7 +156,4 @@ class CLIPModel(nn.Module):
         
         loss_spec = F.cross_entropy(logits_per_spec, labels)
         loss_text = F.cross_entropy(logits_per_text, labels)
-        
-        loss = (loss_spec + loss_text) / 2
-        
-        return loss
+        return (loss_spec + loss_text) / 2

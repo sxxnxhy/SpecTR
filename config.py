@@ -2,6 +2,8 @@
 # Device
 DEVICE = 'cuda:0'
 
+SEED = 42
+WARMUP_STEPS = 0.1
 
 MAX_PEAK_SEQ_LEN = 300    # 스펙트럼 당 최대 피크 (토큰) 시퀀스 길이
 
@@ -14,7 +16,7 @@ MS_ENCODER = {
     # This projects scalar m/z -> vector of size 'fourier_dim'
     'fourier_dim': 256,
     # (m/z, intensity) 2D 입력을 d_model로 임베딩
-    'd_model': 256, 
+    'd_model': 768, 
     'nhead': 8,           # (d_model % nhead == 0)
     'n_layers': 6,        # 트랜스포머 레이어 수
     'dropout': 0.1
@@ -50,6 +52,6 @@ LR_ENCODER = 1e-4
 # MassSpecGym files (automatically downloaded)
 REPO_ID = "roman-bushuiev/MassSpecGym"
 FILENAME_TSV = "data/MassSpecGym.tsv"
-FILENAME_CANDIDATES = "molecules/MassSpecGym_retrieval_candidates_mass.json"
+FILENAME_CANDIDATES = "data/molecules/MassSpecGym_retrieval_candidates_mass.json"
 MASSSPECGYM_LOG_DIR = './logs'
 MASSSPECGYM_CKPT_DIR = './models'
