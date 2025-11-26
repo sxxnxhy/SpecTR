@@ -21,11 +21,10 @@ class MSEncoder(nn.Module):
     def __init__(self, encoder_config, embedding_dim):
         super().__init__()
         
-        d_model = encoder_config['d_model'] # Now 768
+        d_model = encoder_config['d_model'] 
         fourier_dim = encoder_config['fourier_dim'] 
         
-        # --- 1. m/z Pathway (Location) ---
-        # Uses Fourier Features for high frequency position info
+        # 1. m/z Pathway
         self.mz_fourier = GaussianFourierProjection(fourier_dim, scale=30.0)
         self.mz_mlp = nn.Sequential(
             nn.Linear(fourier_dim, d_model),
@@ -33,15 +32,16 @@ class MSEncoder(nn.Module):
             nn.Linear(d_model, d_model)
         )
         
-        # --- 2. Intensity Pathway (Magnitude) [FIXED] ---
-        # REMOVED Fourier Projection. Now simple scalar projection.
+        # Instead of 1 -> 768, we do 1 -> 64 -> 768
+        # This prevents the model from over-interpreting the scalar noise.
         self.int_mlp = nn.Sequential(
-            nn.Linear(1, d_model), # Project scalar directly to d_model
+            nn.Linear(1, 64),         # Bottleneck
             nn.GELU(),
-            nn.Linear(d_model, d_model)
+            nn.Linear(64, d_model),   # Expand
+            nn.LayerNorm(d_model)     # Stabilize
         )
         
-        # --- 3. Fusion Layer ---
+        # Fusion
         self.fusion = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.LayerNorm(d_model)

@@ -1,4 +1,3 @@
-
 import os
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -13,10 +12,11 @@ import pickle
 from rdkit import Chem
 from rdkit import RDLogger
 from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 
+RDLogger.DisableLog('rdApp.*') 
 
-# --- HELPER FUNCTIONS (Must be outside class for Parallel Processing) ---
+# --- HELPER FUNCTIONS ---
 
 def canonicalize_smiles(s):
     try:
@@ -26,23 +26,53 @@ def canonicalize_smiles(s):
     except:
         return s
 
+def process_spectrum_data(args):
+    """
+    Worker function to process raw strings into Tensors ONCE.
+    """
+    mzs_str, ints_str, max_len = args
+    
+    try:
+        mzs = np.array([float(x) for x in mzs_str.split(',')])
+        intensities = np.array([float(x) for x in ints_str.split(',')])
+    except:
+        # Fallback for empty/bad data
+        return torch.zeros(max_len, 2), torch.zeros(max_len, dtype=torch.bool)
+
+    # Physics logic (Square root + Norm + Log mass)
+    root_ints = np.sqrt(intensities)
+    max_int = root_ints.max() if len(root_ints) > 0 else 1.0
+    if max_int < 1e-9: max_int = 1.0
+    norm_ints = root_ints / max_int
+    log_mzs = np.log(mzs + 1.0)
+    
+    # Pack into list
+    processed = list(zip(log_mzs, norm_ints))
+    
+    # Sort by Intensity (Keep top K)
+    if len(processed) > max_len:
+        processed.sort(key=lambda x: x[1], reverse=True)
+        processed = processed[:max_len]
+    
+    # Sort by Mass (Transformer Positional Logic)
+    processed.sort(key=lambda x: x[0])
+    
+    # Convert to Tensor
+    peak_sequence = torch.zeros(max_len, 2, dtype=torch.float32)
+    peak_mask = torch.zeros(max_len, dtype=torch.bool)
+    
+    if len(processed) > 0:
+        peak_sequence[:len(processed)] = torch.tensor(processed)
+        peak_mask[:len(processed)] = True
+        
+    return peak_sequence, peak_mask
+
 def process_candidate_item(args):
-    """
-    Worker function to process a single dictionary item in parallel.
-    args: (key, value_list, set_of_valid_keys)
-    """
     k, v_list, relevant_smiles = args
-    
-    # 1. Canonicalize the Key (Query)
     can_k = canonicalize_smiles(k)
-    
-    # 2. Check if this query is actually in our validation set
-    #    (If not, skip the heavy work of processing its 256 candidates)
     if can_k in relevant_smiles:
-        # 3. Canonicalize the Values (Candidates)
         can_v = [canonicalize_smiles(c) for c in v_list]
         return (can_k, can_v)
-    
     return None
 
 # -----------------------------------------------------------------------
@@ -53,46 +83,60 @@ class MassSpecGymTrainDataset(Dataset):
         self.max_len = max_len
         self.retrieval_mode = retrieval_mode
         
-        if isinstance(split, str):
-            self.split_names = [split]
-        else:
-            self.split_names = split
+        if isinstance(split, str): self.split_names = [split]
+        else: self.split_names = split
             
         split_sig = "_".join(self.split_names)
-        print(f"\n[Data] Initializing MassSpecGym for split(s): {self.split_names} (Retrieval Mode: {retrieval_mode})")
+        print(f"\n[Data] Initializing MassSpecGym for {self.split_names} (Retrieval: {retrieval_mode})")
 
-        # --- CACHE CHECK ---
-        cache_filename = f"cached_massspecgym_{split_sig}_{retrieval_mode}.pkl"
+        # --- 1. CACHE CHECK ---
+        # Note: I changed the version name to force a re-cache since structure changed
+        cache_filename = f"cached_v2_tensors_{split_sig}_{retrieval_mode}.pkl"
         
         if os.path.exists(cache_filename):
-            print(f"   -> 🚀 Fast-loading from cache: {cache_filename}")
+            print(f"   -> 🚀 Fast-loading TENSORS from cache: {cache_filename}")
             with open(cache_filename, 'rb') as f:
                 data = pickle.load(f)
                 self.df = data['df']
                 self.candidates_map = data.get('candidates_map', {})
+                # [FIX A] Load pre-computed tensors
+                self.precomputed_spectra = data['spectra'] 
             print(f"   -> ✅ Loaded {len(self.df)} samples.")
             return
 
-        # --- LOAD FROM SCRATCH ---
-        print("   -> ⏳ Cache not found. Loading from source...")
+        # --- 2. LOAD & PROCESS FROM SCRATCH ---
+        print("   -> ⏳ Processing data from scratch (This runs ONCE)...")
         
-        # 1. Load TSV
         try:
             tsv_path = hf_hub_download(repo_id=config.REPO_ID, filename=config.FILENAME_TSV, repo_type="dataset")
         except:
             tsv_path = config.FILENAME_TSV
             
         df = pd.read_csv(tsv_path, sep="\t")
-        
-        # Filter splits
         self.df = df[df['fold'].isin(self.split_names)].reset_index(drop=True)
         self.df = self.df.dropna(subset=['smiles'])
         
-        print(f"   -> Canonicalizing {len(self.df)} TSV SMILES...")
-        # (This part is usually fast enough, but could be parallelized if needed)
+        print(f"   -> Canonicalizing {len(self.df)} SMILES...")
         self.df['smiles'] = self.df['smiles'].apply(canonicalize_smiles)
+
+        # --- [FIX A] PRE-COMPUTE TENSORS NOW ---
+        print(f"   -> ⚡ Pre-computing Spectra Tensors (CPU Optimized)...")
         
-        # 2. Load Candidates (ONLY for Validation)
+        # Prepare args: (mzs, ints, max_len)
+        tasks = [
+            (row['mzs'], row['intensities'], self.max_len) 
+            for _, row in self.df.iterrows()
+        ]
+        
+        with ProcessPoolExecutor() as executor:
+            # Result is a list of tuples: [(seq, mask), (seq, mask), ...]
+            self.precomputed_spectra = list(tqdm(
+                executor.map(process_spectrum_data, tasks), 
+                total=len(tasks),
+                desc="Processing Spectra"
+            ))
+
+        # 3. Load Candidates (Validation Only)
         self.candidates_map = {}
         if self.retrieval_mode:
             print(f"   -> Loading Candidates JSON...")
@@ -104,84 +148,42 @@ class MassSpecGymTrainDataset(Dataset):
             with open(json_path, 'r') as f:
                 raw_map = json.load(f)
             
-            # --- PARALLEL PROCESSING START ---
-            print(f"   -> ⚡ Canonicalizing Candidate Map (Parallel Processing)...")
-            
-            # Create a set for O(1) lookups
+            print(f"   -> ⚡ Processing Candidates...")
             relevant_smiles = set(self.df['smiles'].values)
-            
-            # Prepare arguments for workers
-            # We only send items from the map, coupled with the valid keys set
             tasks = [(k, v, relevant_smiles) for k, v in raw_map.items()]
             
-            # Use all available CPU cores
             with ProcessPoolExecutor() as executor:
-                # Wrap in tqdm for a progress bar
-                results = list(tqdm(
-                    executor.map(process_candidate_item, tasks), 
-                    total=len(tasks),
-                    desc="Processing Candidates"
-                ))
+                results = list(tqdm(executor.map(process_candidate_item, tasks), total=len(tasks)))
             
-            # Filter out None results (skipped items) and build dict
             for res in results:
                 if res is not None:
-                    k, v = res
-                    self.candidates_map[k] = v
-            # --- PARALLEL PROCESSING END ---
+                    self.candidates_map[res[0]] = res[1]
 
             valid_indices = [i for i, row in self.df.iterrows() if row['smiles'] in self.candidates_map]
+            
+            # Filter DF and Tensors together
             self.df = self.df.iloc[valid_indices].reset_index(drop=True)
-            print(f"   -> Filtered to {len(self.df)} queries with valid candidates.")
+            self.precomputed_spectra = [self.precomputed_spectra[i] for i in valid_indices]
+            
+            print(f"   -> Filtered to {len(self.df)} queries.")
 
-        # --- SAVE CACHE ---
-        print(f"   -> 💾 Saving cache to {cache_filename}...")
+        # --- 4. SAVE CACHE ---
+        print(f"   -> 💾 Saving TENSOR cache to {cache_filename}...")
         with open(cache_filename, 'wb') as f:
-            pickle.dump({'df': self.df, 'candidates_map': self.candidates_map}, f)
-
-        print(f"✅ Loaded {len(self.df)} spectra.")
+            pickle.dump({
+                'df': self.df, 
+                'candidates_map': self.candidates_map,
+                'spectra': self.precomputed_spectra # Saving the heavy tensors
+            }, f)
 
     def __len__(self):
         return len(self.df)
-    
-    def _process_spectrum(self, mzs_str, ints_str):
-        # ... (Same as before) ...
-        try:
-            mzs = np.array([float(x) for x in mzs_str.split(',')])
-            intensities = np.array([float(x) for x in ints_str.split(',')])
-        except:
-            return torch.zeros(self.max_len, 2), torch.zeros(self.max_len, dtype=torch.bool)
-
-        root_ints = np.sqrt(intensities)
-        max_int = root_ints.max() if len(root_ints) > 0 else 1.0
-        if max_int < 1e-9: max_int = 1.0
-        norm_ints = root_ints / max_int
-        
-        log_mzs = np.log(mzs + 1.0)
-        
-        processed = list(zip(log_mzs, norm_ints))
-        
-        if len(processed) > self.max_len:
-            processed.sort(key=lambda x: x[1], reverse=True)
-            processed = processed[:self.max_len]
-        
-        processed.sort(key=lambda x: x[0])
-        
-        peak_sequence = torch.zeros(self.max_len, 2, dtype=torch.float32)
-        peak_mask = torch.zeros(self.max_len, dtype=torch.bool)
-        
-        if len(processed) > 0:
-            peak_sequence[:len(processed)] = torch.tensor(processed)
-            peak_mask[:len(processed)] = True
-            
-        return peak_sequence, peak_mask
 
     def __getitem__(self, idx):
-        # ... (Same as before) ...
+        # [FIX A] No processing here. Just array lookup. Instant.
+        peak_seq, peak_mask = self.precomputed_spectra[idx]
         row = self.df.iloc[idx]
         smiles = row['smiles']
-        
-        peak_seq, peak_mask = self._process_spectrum(row['mzs'], row['intensities'])
         
         item = {
             'peak_sequence': peak_seq,
