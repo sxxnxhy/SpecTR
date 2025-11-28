@@ -19,7 +19,8 @@ MS_ENCODER = {
     'd_model': 768, 
     'nhead': 8,           # (d_model % nhead == 0)
     'n_layers': 6,        # 트랜스포머 레이어 수
-    'dropout': 0.1
+    'dropout': 0.1,
+    'fourier_scale': 30.0
 }
 
 # loss temperature

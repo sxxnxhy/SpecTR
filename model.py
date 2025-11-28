@@ -8,7 +8,7 @@ import numpy as np
 from peft import get_peft_model, LoraConfig, TaskType
 
 class GaussianFourierProjection(nn.Module):
-    def __init__(self, embed_dim, scale=30.0):
+    def __init__(self, embed_dim, scale):
         super().__init__()
         self.B = nn.Parameter(torch.randn(1, embed_dim // 2) * scale, requires_grad=False)
 
@@ -23,9 +23,9 @@ class MSEncoder(nn.Module):
         
         d_model = encoder_config['d_model'] 
         fourier_dim = encoder_config['fourier_dim'] 
-        
+        fourier_scale = encoder_config.get('fourier_scale')
         # 1. m/z Pathway
-        self.mz_fourier = GaussianFourierProjection(fourier_dim, scale=30.0)
+        self.mz_fourier = GaussianFourierProjection(fourier_dim, scale=fourier_scale)
         self.mz_mlp = nn.Sequential(
             nn.Linear(fourier_dim, d_model),
             nn.GELU(),
